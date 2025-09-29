@@ -1,0 +1,260 @@
+---
+title: "Contoh Case Poisson"
+output: html_notebook
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r}
+library(rjags)
+library(ggplot2)
+library(loo)
+set.seed(42)
+```
+
+
+
+# Exploratory Data Analysis
+
+```{r}
+#read csv
+bike <- read.csv("bike-train.csv")
+head(bike)
+```
+
+```{r}
+#structure of the data
+str(bike)
+```
+
+```{r}
+which(duplicated(bike))
+```
+
+```{r}
+colSums(is.na(bike))
+```
+
+The data is clean, so we can move on to modelling.
+
+Before that sample the data, so that the modelling process won;t take too long.
+> Only 1000 samples will be extracted.
+
+```{r}
+bike <- bike[sample(nrow(bike), 1000), ]
+```
+
+We will now create the model string, so we will need to define the priors.
+
+> The priors for the intercept and slopes will be Jeffreys priors, since we want to analyse the significance of every column.
+
+For the Jeffreys prior, we will be using an estimate of it, being beta ~ Normal(0, 1e-6).
+
+
+# Modelling
+
+```{r}
+str_pois <- "
+  model{
+    for (i in 1:N){
+      Y[i] ~ dpois(lambda[i])
+      log(lambda[i]) <- beta_0 + inprod(beta[], X[i, ])
+      
+      log_lik[i] <- logdensity.pois(Y[i], lambda[i])
+    }
+    
+    beta_0 ~ dnorm(0, 1e-6)
+    
+    for (i in 1:col){
+      beta[i] ~ dnorm(0, 1e-6)
+    }
+  }
+"
+```
+
+Next, we will be making the data list.
+
+```{r}
+#Subset the Data
+X = subset(bike, select =-c(count, datetime))
+Y = bike$count
+n_row = nrow(X)
+n_col = ncol(X)
+```
+
+```{r}
+#scale the data
+X_scaled = scale(X)
+```
+
+Scaling is done to ensure every parameter has equal impact.
+
+```{r}
+#create the data
+data_list <- list(
+  X = X_scaled,
+  Y = Y,
+  N = n_row,
+  col = n_col
+)
+```
+
+Now, we will create initial values.
+> Initial values are essential as starting points for our model, as a good starting values will lead to better and faster convergence.
+
+Here, I will be using random values that follow the distribution of the priors, only with a much larger precision.
+
+> This is to ensure a good initial value that is more centered around 0.
+
+```{r}
+inits <- function() {
+  list(
+    beta_0 = rnorm(1,0,1),
+    beta = rnorm(n_col, 0, 1)
+  )
+}
+```
+
+Because we are using random suboptimal values, we can afford to use more chains.
+
+> More chains with random values allows us to capture the cocmplete robustness of the model.
+
+```{r}
+model_pois <- jags.model(
+  textConnection(str_pois),
+  data = data_list,
+  inits = inits,
+  n.chains = 5
+)
+```
+
+After the modelling process, we will do a burn-in process.
+> Burn-in removes the extreme values that the first iterations could generate.
+
+```{r}
+update(model_pois, 1e3)
+```
+
+## Sampling
+
+```{r}
+samples_pois <- coda.samples(
+  model = model_pois,
+  variable.names = c("beta_0","beta", "log_lik", "lambda"),
+  n.iter = 1e4
+)
+```
+
+# Evaluation
+
+## Subset the Intercept and Slopes
+
+This is done to save computing power.
+
+```{r}
+samples_pbeta <- samples_pois[, grep("beta_0|beta\\[", colnames(samples_pois[[1]]))]
+```
+
+```{r}
+summary(samples_pbeta)
+```
+
+```{r}
+plot(samples_pbeta)
+```
+
+```{r}
+for (i in 1:5){
+  cat("Chain", i, ":")
+  print(geweke.diag(samples_pbeta[[i]]))
+}
+```
+
+Chain 4 ama Chain 5 ga converge gara2 di atas 2 z-scorenya
+
+```{r}
+gelman.diag(samples_pbeta)
+```
+1.01 udah bagus ya sob
+
+```{r}
+raftery.diag(samples_pbeta)
+```
+
+```{r}
+effectiveSize(samples_pbeta)
+```
+
+# PPC
+
+```{r}
+samples_matrix <- as.matrix(samples_pois)
+mat_beta_0 <- as.matrix(samples_matrix[, "beta_0"])
+mat_beta <- as.matrix(samples_matrix[, grep("beta\\[", colnames(samples_matrix))])
+```
+
+```{r}
+pred_lambda <- matrix(NA, nrow=nrow(mat_beta), ncol=nrow(X))
+
+for (i in 1:nrow(mat_beta)){
+  pred_lambda[i, ] <- exp(mat_beta_0[i] + X_scaled %*% mat_beta[i, ]) 
+}
+```
+
+```{r}
+pred_y <- matrix(NA, nrow = nrow(mat_beta), ncol = nrow(X))
+
+for(i in 1:nrow(mat_beta)){
+  for(j in 1:nrow(X)){
+    pred_y[i,j] <- rpois(1, pred_lambda[i, j])
+  }
+}
+```
+
+
+```{r}
+pred_mean = apply(pred_y, 2, mean)
+df_pred = data.frame(
+  True = Y,
+  Predicted = pred_mean,
+  Residual = abs(Y-pred_mean)
+)
+
+df_pred
+```
+
+```{r}
+#DISTRIBUTION OF RESIDUALS
+
+ggplot() +
+  geom_density(data = df_pred, aes(x = Predicted), color = "orange", fill = "orange", alpha = 0.3) +
+  geom_density(data = df_pred, aes(x = True), color = "blue", fill = "blue", alpha = 0.3) +
+  labs(title = "Density of True vs Predicted",
+       x = "Values",
+       y = "Density",
+       fill = "Legend") +
+  theme_minimal()
+```
+
+```{r}
+#distribution of residuals
+ggplot() +
+ geom_density(data = df_pred, aes(x = Residual), color = "violet", fill = "maroon", alpha = 0.3) +
+  labs(
+    title = "Distribution of Residuals",
+    x = "Residuals",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),  # Centered title
+    axis.title = element_text(size = 12),  # Axis labels
+    axis.text = element_text(size = 10)  # Axis ticks
+  )
+```
+
+```{r}
+mean(pred_mean >= Y)
+```
+
